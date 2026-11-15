@@ -28,10 +28,8 @@ if (!owner || !repo || !/^\d+$/.test(PR_NUMBER)) {
   throw new Error("Invalid REPOSITORY or PR_NUMBER.");
 }
 
-const MAX_DIFF_CHARS = 12000;
+const MAX_DIFF_CHARS = 30000;
 const MAX_FILE_LIST_CHARS = 4500;
-const DIFF_BUDGETS = { 3: 8500, 2: 2800, 1: 700 };
-const PER_FILE_LIMITS = { 3: 2500, 2: 1200, 1: 700 };
 
 function truncate(text, maxLength) {
   const value = String(text ?? "");
@@ -79,12 +77,17 @@ function priorityOf(filename) {
   return 1;
 }
 
-// ファイルの途中で切れた場合は、そのことを明示する。
+// 差分を切る場合は、省略表示も含めてmaxChars以内に収める。
+// できる限り行の途中で切らず、残りが少ない場合は必要な位置で切る。
 function clipPatch(patch, maxChars) {
   if (patch.length <= maxChars) return { text: patch, clipped: false };
-  const lastNewline = patch.lastIndexOf("\n", maxChars);
-  const end = lastNewline > maxChars / 2 ? lastNewline : maxChars;
-  return { text: `${patch.slice(0, end)}\n[このファイルの差分は途中まで]`, clipped: true };
+  const marker = "\n[このファイルの差分は途中まで]";
+  if (maxChars <= marker.length) return { text: "", clipped: true };
+
+  const usable = maxChars - marker.length;
+  const lastNewline = patch.lastIndexOf("\n", usable);
+  const end = lastNewline > usable / 2 ? lastNewline : usable;
+  return { text: patch.slice(0, end) + marker, clipped: true };
 }
 
 const base = `/repos/${owner}/${repo}/pulls/${PR_NUMBER}`;
@@ -98,37 +101,49 @@ const fileList = truncate(
   MAX_FILE_LIST_CHARS
 );
 
-const grouped = { 3: [], 2: [], 1: [] };
-for (const file of files) {
-  const priority = priorityOf(file.filename);
-  if (priority > 0 && typeof file.patch === "string" && file.patch.length > 0) {
-    grouped[priority].push(file);
-  }
-}
+// 1ファイルごとの固定上限は設けず、全体の文字数上限だけで管理する。
+// まず全文が入る差分を優先度順に入れ、残った容量に大きな差分を詰める。
+// これにより小さな.editorconfig等が無用に途中で切れるのを防ぐ。
+const candidates = files
+  .filter((f) => priorityOf(f.filename) > 0 && typeof f.patch === "string" && f.patch.length > 0)
+  .map((file) => ({
+    file,
+    priority: priorityOf(file.filename),
+    header: `\n## ${file.filename} (${file.status})\n`,
+  }))
+  .sort((a, b) => b.priority - a.priority || a.file.patch.length - b.file.patch.length);
 
-const diffParts = [];
-const selectedFiles = new Set();
-let clippedFiles = 0;
+const selections = new Map();
 let charsUsed = 0;
 
-for (const priority of [3, 2, 1]) {
-  let budget = DIFF_BUDGETS[priority];
-  for (const file of grouped[priority]) {
-    const header = `\n## ${file.filename} (${file.status})\n`;
-    const available = Math.min(PER_FILE_LIMITS[priority], budget - header.length - 50);
-    if (available < 150) break;
-
-    const { text, clipped } = clipPatch(file.patch, available);
-    const part = header + text + "\n";
-    if (part.length > budget || charsUsed + part.length > MAX_DIFF_CHARS) break;
-
-    diffParts.push(part);
-    selectedFiles.add(file.filename);
-    charsUsed += part.length;
-    budget -= part.length;
-    if (clipped) clippedFiles++;
-  }
+// 第1段階: 全文を収められるファイルを入れる。
+for (const entry of candidates) {
+  const part = entry.header + entry.file.patch + "\n";
+  if (charsUsed + part.length > MAX_DIFF_CHARS) continue;
+  selections.set(entry.file.filename, { text: part, clipped: false });
+  charsUsed += part.length;
 }
+
+// 第2段階: まだ送っていないファイルを残りの容量で部分的に取り込む。
+// 極端に短い断片しか送れない場合は無理に詰め込まない。
+for (const entry of candidates) {
+  if (selections.has(entry.file.filename)) continue;
+  const available = MAX_DIFF_CHARS - charsUsed - entry.header.length - 1;
+  if (available < 150) break;
+  const { text, clipped } = clipPatch(entry.file.patch, available);
+  if (!text) continue;
+  const part = entry.header + text + "\n";
+  if (charsUsed + part.length > MAX_DIFF_CHARS) continue;
+  selections.set(entry.file.filename, { text: part, clipped });
+  charsUsed += part.length;
+}
+
+// 出力順序は重要度順に揃える。
+const diffParts = candidates
+  .filter((entry) => selections.has(entry.file.filename))
+  .map((entry) => selections.get(entry.file.filename).text);
+const selectedFiles = new Set(selections.keys());
+const clippedFiles = [...selections.values()].filter((value) => value.clipped).length;
 
 const excludedCount = files.filter((f) => priorityOf(f.filename) === 0).length;
 const noPatchCount = files.filter((f) => priorityOf(f.filename) > 0 && !f.patch).length;
@@ -207,6 +222,8 @@ const usage = response.usage;
 console.log("PR files:", files.length);
 console.log("Diff files sent:", selectedFiles.size);
 console.log("Diff characters sent:", charsUsed);
+console.log("Partial diff files:", clippedFiles);
+console.log("Unsent diff files:", omittedCount);
 console.log("Model:", OPENAI_MODEL);
 console.log("Input tokens:", usage?.input_tokens ?? "unknown");
 console.log("Output tokens:", usage?.output_tokens ?? "unknown");
